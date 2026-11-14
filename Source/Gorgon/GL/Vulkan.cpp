@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <fstream>
 #include <functional>
@@ -35,6 +36,13 @@ namespace Gorgon :: GL {
 	constexpr uint32_t DescriptorsPerPool = 1024;
 	constexpr int TextureUnits = 2;
 
+	/// Texture uploads are staged in persistently mapped buffers of this size, larger uploads get their own
+	constexpr VkDeviceSize StagingChunkSize = 4 * 1024 * 1024;
+
+	/// Uploads are normally submitted with the next frame. If this much data is waiting, it is submitted
+	/// immediately so that loading many images before the first frame does not use too much memory.
+	constexpr VkDeviceSize MaxPendingStaging = 64 * 1024 * 1024;
+
 	/// Uniforms of a quad, sent as push constants. This should match Graphics/Shaders/Vulkan/Uniforms.glsl
 	struct Uniforms {
 		float vertex_coords[4][4];
@@ -59,6 +67,7 @@ namespace Gorgon :: GL {
 		Geometry::Size size = {0, 0};
 		VkFilter filter = VK_FILTER_LINEAR;
 		bool inuse = false;
+		uint64_t lastuse = 0; //use tick of the last draw that sampled this texture, 0 if not used
 	};
 
 	/// Pipelines depend on blending and are created when they are first used
@@ -93,6 +102,24 @@ namespace Gorgon :: GL {
 		bool inpass = false;
 		VF::VulkanGraphicsPipeline *pipeline = nullptr;
 		VkDescriptorSet boundsets[TextureUnits] = {};
+		Texture boundtextures[TextureUnits] = {};
+		uint64_t firsttick = 0; //use tick when the recording is started
+	};
+
+	struct StagingChunk {
+		VF::Buffer buffer{};
+		Byte *data = nullptr;
+		VkDeviceSize size = 0;
+		VkDeviceSize used = 0;
+	};
+
+	/// Texture creation and uploads are recorded to a separate command buffer which is submitted just
+	/// before the commands of the next frame. Therefore, uploading never waits for the GPU.
+	struct UploadBatch {
+		VkCommandBuffer commandbuffer = VK_NULL_HANDLE;
+		std::vector<StagingChunk> chunks;
+		VkDeviceSize staged = 0;
+		uint64_t serial = 0;
 	};
 
 	/// Resources are retired when they are no longer needed by Gorgon, but they could still be used by
@@ -128,6 +155,12 @@ namespace Gorgon :: GL {
 		uint64_t lastsubmit = 0;
 		uint64_t completed = 0;
 
+		UploadBatch upload;
+		std::deque<UploadBatch> uploadsinflight;
+		std::vector<VkCommandBuffer> freeuploadbuffers;
+		std::vector<StagingChunk> freechunks;
+		uint64_t usetick = 0;
+
 		//The state that OpenGL would keep
 		WindowContext *current = nullptr;
 		Uniforms uniforms{};
@@ -150,7 +183,6 @@ namespace Gorgon :: GL {
 		// All formats are linear: Gorgon blends in gamma space and its colors would be washed out with sRGB.
 		const std::vector<VkFormat> surfaceformats = {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
 
-#ifndef NDEBUG
 		VKAPI_ATTR VkBool32 VKAPI_CALL debugproc(
 			VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT,
 			const VkDebugUtilsMessengerCallbackDataEXT *data, void *
@@ -179,24 +211,33 @@ namespace Gorgon :: GL {
 
 			return false;
 		}
-#endif
+
+		/// Validation layers slow down every Vulkan call considerably, they are only enabled on request
+		/// by setting GORGON_VULKAN_VALIDATION=1, regardless of the build type.
+		bool validationrequested() {
+			auto value = std::getenv("GORGON_VULKAN_VALIDATION");
+
+			return value && *value && std::string(value) != "0";
+		}
 
 		void createinstance() {
 			std::vector<const char *> extensions = {VK_KHR_SURFACE_EXTENSION_NAME, GetNativeSurfaceExtension()};
 			std::vector<const char *> layers;
 
-#ifndef NDEBUG
-			bool validation = hasvalidationlayer();
+			bool validation = validationrequested();
+			if(validation && !hasvalidationlayer()) {
+				std::cerr << "Vulkan: validation is requested but " << VF::validationLayers[0] << " is not installed" << std::endl;
+				validation = false;
+			}
+
 			if(validation) {
 				layers = VF::validationLayers;
 				extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 			}
-#endif
 
 			//Vulkan 1.1 is required for flipping the viewport
 			vk->instance = VF::CreateInstance(extensions, layers, VK_API_VERSION_1_1, "Gorgon", "Gorgon");
 
-#ifndef NDEBUG
 			if(validation) {
 				VkDebugUtilsMessengerCreateInfoEXT createinfo{};
 				createinfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
@@ -208,8 +249,9 @@ namespace Gorgon :: GL {
 				if(create) {
 					create(vk->instance, &createinfo, nullptr, &vk->messenger);
 				}
+
+				log << "Vulkan validation is enabled";
 			}
-#endif
 		}
 
 		/// Creates the objects that are shared between windows. Needs a surface as it decides the device.
@@ -266,9 +308,230 @@ namespace Gorgon :: GL {
 			}
 		}
 
+		StagingChunk createchunk(VkDeviceSize size) {
+			StagingChunk chunk;
+
+			chunk.buffer = VF::Memory::CreateBuffer(
+				vk->allocator, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+				VMA_MEMORY_USAGE_AUTO, VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+			);
+
+			void *data = nullptr;
+			VF::Memory::MapMemory(vk->allocator, &chunk.buffer, &data);
+
+			if(!data) {
+				vmaDestroyBuffer(vk->allocator, chunk.buffer.buffer, chunk.buffer.deviceMemory);
+				throw std::runtime_error("Cannot map staging buffer");
+			}
+
+			chunk.data = static_cast<Byte *>(data);
+			chunk.size = size;
+
+			return chunk;
+		}
+
+		void destroychunk(StagingChunk &chunk) {
+			VF::Memory::UnMapMemory(vk->allocator, &chunk.buffer);
+			vmaDestroyBuffer(vk->allocator, chunk.buffer.buffer, chunk.buffer.deviceMemory);
+			chunk = {};
+		}
+
+		/// Returns the resources of a completed batch to the free lists. Standard sized chunks are reused,
+		/// larger ones are destroyed.
+		void recycle(UploadBatch &batch) {
+			for(auto &chunk : batch.chunks) {
+				if(chunk.size == StagingChunkSize) {
+					chunk.used = 0;
+					vk->freechunks.push_back(chunk);
+				}
+				else {
+					destroychunk(chunk);
+				}
+			}
+
+			if(batch.commandbuffer) {
+				vk->freeuploadbuffers.push_back(batch.commandbuffer);
+			}
+
+			batch = {};
+		}
+
+		void recycleuploads() {
+			while(!vk->uploadsinflight.empty() && vk->uploadsinflight.front().serial <= vk->completed) {
+				recycle(vk->uploadsinflight.front());
+				vk->uploadsinflight.pop_front();
+			}
+		}
+
 		void waitidle() {
 			vkDeviceWaitIdle(vk->device.logicalDevice);
 			vk->completed = vk->lastsubmit;
+			recycleuploads();
+		}
+
+		/// Returns the command buffer that upload commands should be recorded to, starts it if necessary.
+		VkCommandBuffer uploadcommands() {
+			auto &batch = vk->upload;
+
+			if(batch.commandbuffer) return batch.commandbuffer;
+
+			if(!vk->freeuploadbuffers.empty()) {
+				batch.commandbuffer = vk->freeuploadbuffers.back();
+				vk->freeuploadbuffers.pop_back();
+				vkResetCommandBuffer(batch.commandbuffer, 0);
+			}
+			else {
+				batch.commandbuffer = VF::CreateCommandBuffers(1, vk->device, vk->commandpool)[0];
+			}
+
+			VkCommandBufferBeginInfo begininfo{};
+			begininfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+			begininfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+			if(vkBeginCommandBuffer(batch.commandbuffer, &begininfo) != VK_SUCCESS) {
+				throw std::runtime_error("Cannot begin upload commands");
+			}
+
+			return batch.commandbuffer;
+		}
+
+		/// Ends the upload batch to be submitted, returns null if there is nothing to upload.
+		VkCommandBuffer closeuploads() {
+			auto &batch = vk->upload;
+
+			if(!batch.commandbuffer) return VK_NULL_HANDLE;
+
+			for(auto &chunk : batch.chunks) {
+				vmaFlushAllocation(vk->allocator, chunk.buffer.deviceMemory, 0, chunk.used);
+			}
+
+			if(vkEndCommandBuffer(batch.commandbuffer) != VK_SUCCESS) {
+				throw std::runtime_error("Cannot record upload commands");
+			}
+
+			return batch.commandbuffer;
+		}
+
+		/// Submits the uploads without waiting for a frame. Only used when too much data is waiting, thus
+		/// it simply waits for the queue. It does not count as a submit for retired resources as the
+		/// commands that use them could still be recording.
+		void flushuploads() {
+			auto commandbuffer = closeuploads();
+
+			if(!commandbuffer) return;
+
+			VkSubmitInfo submitinfo{};
+			submitinfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+			submitinfo.commandBufferCount = 1;
+			submitinfo.pCommandBuffers = &commandbuffer;
+
+			if(vkQueueSubmit(vk->device.graphicsQueue, 1, &submitinfo, VK_NULL_HANDLE) != VK_SUCCESS) {
+				throw std::runtime_error("Cannot submit upload commands");
+			}
+
+			vkQueueWaitIdle(vk->device.graphicsQueue);
+
+			recycle(vk->upload);
+
+			vk->completed = vk->lastsubmit;
+			recycleuploads();
+		}
+
+		/// Reserves staging memory for an upload. Returned memory should be filled before the batch is
+		/// submitted. Should be called before uploadcommands() as it could submit the current batch.
+		Byte *stage(VkDeviceSize size, VkBuffer &buffer, VkDeviceSize &offset) {
+			auto &batch = vk->upload;
+
+			if(batch.staged > 0 && batch.staged + size > MaxPendingStaging) {
+				flushuploads();
+			}
+
+			//buffer offsets of copies should be a multiple of 4 and texel size
+			VkDeviceSize aligned = (size + 15) & ~VkDeviceSize(15);
+
+			if(batch.chunks.empty() || batch.chunks.back().used + aligned > batch.chunks.back().size) {
+				if(aligned <= StagingChunkSize && !vk->freechunks.empty()) {
+					batch.chunks.push_back(vk->freechunks.back());
+					vk->freechunks.pop_back();
+				}
+				else {
+					batch.chunks.push_back(createchunk(std::max(aligned, StagingChunkSize)));
+				}
+			}
+
+			auto &chunk = batch.chunks.back();
+
+			buffer = chunk.buffer.buffer;
+			offset = chunk.used;
+
+			chunk.used += aligned;
+			batch.staged += aligned;
+
+			return chunk.data + offset;
+		}
+
+		/// Pipeline stages that textures are used in: sampled or rendered to
+		constexpr VkPipelineStageFlags TextureStages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+		constexpr VkAccessFlags TextureAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+		void imagebarrier(
+			VkCommandBuffer commandbuffer, VkImage image, VkImageLayout from, VkImageLayout to,
+			VkPipelineStageFlags srcstage, VkAccessFlags srcaccess, VkPipelineStageFlags dststage, VkAccessFlags dstaccess
+		) {
+			VkImageMemoryBarrier barrier{};
+			barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+			barrier.oldLayout = from;
+			barrier.newLayout = to;
+			barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.image = image;
+			barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+			barrier.srcAccessMask = srcaccess;
+			barrier.dstAccessMask = dstaccess;
+
+			vkCmdPipelineBarrier(commandbuffer, srcstage, dststage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+		}
+
+		/// Textures are kept in shader read only layout. Transfers move them to the given transfer layout.
+		void totransfer(VkCommandBuffer commandbuffer, VkImage image, VkImageLayout layout, VkAccessFlags access) {
+			imagebarrier(
+				commandbuffer, image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, layout,
+				TextureStages, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, access
+			);
+		}
+
+		void fromtransfer(VkCommandBuffer commandbuffer, VkImage image, VkImageLayout layout, VkAccessFlags access) {
+			imagebarrier(
+				commandbuffer, image, layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				VK_PIPELINE_STAGE_TRANSFER_BIT, access, TextureStages, TextureAccess
+			);
+		}
+
+		/// Whether the texture is sampled by a command buffer that is still being recorded. Could return
+		/// true for a texture that is used by an already submitted frame, which is harmless.
+		bool isrecorded(const TextureSlot &slot) {
+			if(!slot.lastuse) return false;
+
+			for(auto ctx : vk->contexts) {
+				if(ctx->recording && slot.lastuse > ctx->firsttick) return true;
+			}
+
+			return false;
+		}
+
+		/// Records copying staged pixels to the given region of the image
+		void recordupload(VkImage image, VkBuffer buffer, VkDeviceSize offset, int x, int y, int w, int h) {
+			auto commandbuffer = uploadcommands();
+
+			VkBufferImageCopy region{};
+			region.bufferOffset = offset;
+			region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+			region.imageOffset = {x, y, 0};
+			region.imageExtent = {(uint32_t)w, (uint32_t)h, 1};
+
+			totransfer(commandbuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT);
+			vkCmdCopyBufferToImage(commandbuffer, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+			fromtransfer(commandbuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT);
 		}
 
 		VkDescriptorSet allocatedescriptor(size_t &poolindex) {
@@ -369,21 +632,39 @@ namespace Gorgon :: GL {
 			slot.size = size;
 			slot.mode = mode;
 			slot.filter = filter;
+			slot.lastuse = 0;
+
+			//transfer source is needed to copy the contents while updating a texture in use
+			VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+			if(rendertarget) {
+				usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+			}
+
+			auto format = rendertarget ? vk->targetformat : getformat(mode);
+
+			slot.image = VF::Memory::CreateImage(vk->allocator, extent.width, extent.height, format, VK_IMAGE_TILING_OPTIMAL, usage, VMA_MEMORY_USAGE_GPU_ONLY, 0);
 
 			if(rendertarget) {
-				auto target = VF::CreateOffscreenTarget(vk->device, vk->allocator, vk->commandpool, vk->texturepass, vk->targetformat, extent);
-
-				slot.image = target.image;
-				slot.view = target.imageView;
-				slot.framebuffer = target.frameBuffer;
+				slot.view = VF::SwapchainHelpers::CreateImageView(vk->device.logicalDevice, slot.image.image, format, VK_IMAGE_ASPECT_COLOR_BIT);
+				slot.framebuffer = VF::CreateColorFramebuffer(vk->device.logicalDevice, vk->texturepass, slot.view, extent);
 			}
 			else {
-				auto format = getformat(mode);
-
-				slot.image = VF::CreateEmptyTextureImage(vk->device, vk->allocator, vk->commandpool, format, extent);
 				slot.view = VF::SwapchainHelpers::CreateImageView(vk->device.logicalDevice, slot.image.image, format, VK_IMAGE_ASPECT_COLOR_BIT, getswizzle(mode));
 				slot.framebuffer = VK_NULL_HANDLE;
 			}
+
+			//images start cleared and in shader read only layout, recorded to be executed before the next frame
+			auto commandbuffer = uploadcommands();
+
+			VkClearColorValue clearcolor{};
+			VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+			imagebarrier(
+				commandbuffer, slot.image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT
+			);
+			vkCmdClearColorImage(commandbuffer, slot.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearcolor, 1, &range);
+			fromtransfer(commandbuffer, slot.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT);
 
 			createdescriptor(slot);
 		}
@@ -404,6 +685,37 @@ namespace Gorgon :: GL {
 			slot.image = {};
 			slot.view = VK_NULL_HANDLE;
 			slot.framebuffer = VK_NULL_HANDLE;
+		}
+
+		/// Replaces the image of a texture that is used by commands being recorded. The old image stays
+		/// alive until those commands are completed. If requested, the contents are copied to the new image
+		/// before the frame, at that point the old image contains all the updates prior to this one.
+		void copyonwrite(TextureSlot &slot, bool keepcontents) {
+			auto old = slot.image.image;
+
+			retireimage(slot);
+			createimage(slot, slot.size, slot.mode, slot.filter, false);
+
+			if(!keepcontents) return;
+
+			auto commandbuffer = uploadcommands();
+			auto current = slot.image.image;
+
+			VkImageCopy region{};
+			region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+			region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+			region.extent = {(uint32_t)std::max(slot.size.Width, 1), (uint32_t)std::max(slot.size.Height, 1), 1};
+
+			totransfer(commandbuffer, old, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT);
+			totransfer(commandbuffer, current, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT);
+
+			vkCmdCopyImage(
+				commandbuffer, old, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				current, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region
+			);
+
+			fromtransfer(commandbuffer, old, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0);
+			fromtransfer(commandbuffer, current, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT);
 		}
 
 		Texture allocatetexture() {
@@ -432,7 +744,11 @@ namespace Gorgon :: GL {
 			slot.inuse = true;
 			createimage(slot, {1, 1}, Graphics::ColorMode::RGBA, VK_FILTER_NEAREST, false);
 
-			VF::UpdateTextureImage(vk->device, vk->allocator, vk->commandpool, slot.image.image, black, sizeof(black), {0, 0}, {1, 1});
+			VkBuffer buffer;
+			VkDeviceSize offset;
+			std::memcpy(stage(sizeof(black), buffer, offset), black, sizeof(black));
+
+			recordupload(slot.image.image, buffer, offset, 0, 0, 1, 1);
 		}
 
 		bool isvalidtexture(Texture tex) {
@@ -507,14 +823,24 @@ namespace Gorgon :: GL {
 				destmode = Graphics::ColorMode::BGRA;
 			}
 
+			//Commands that are already recorded should see the old contents, as in OpenGL. Instead of
+			//submitting and waiting, the update goes to a copy of the texture. Render targets are excluded
+			//as their contents are not known before the frame is executed.
+			if(!slot.framebuffer && isrecorded(slot)) {
+				bool whole = target.X == 0 && target.Y == 0 && w == slot.size.Width && h == slot.size.Height;
+
+				copyonwrite(slot, !whole);
+			}
+
 			size_t sourcebpp = Graphics::GetChannelsPerPixel(sourcemode);
 			size_t destbpp = Graphics::GetChannelsPerPixel(destmode);
 			size_t sourcestride = sourcebpp * data.GetWidth();
 
-			std::vector<Byte> pixels(destbpp * w * h);
+			VkBuffer buffer;
+			VkDeviceSize offset;
 
 			const Byte *sourcerow = data.RawData() + sourcebpp * source.Left + sourcestride * source.Top;
-			Byte *destrow = pixels.data();
+			Byte *destrow = stage(destbpp * w * h, buffer, offset);
 
 			for(int y = 0; y < h; y++) {
 				if(sourcemode == destmode) {
@@ -530,13 +856,7 @@ namespace Gorgon :: GL {
 				destrow += destbpp * w;
 			}
 
-			VF::UpdateTextureImage(
-				vk->device, vk->allocator, vk->commandpool, slot.image.image, pixels.data(), pixels.size(),
-				{target.X, target.Y}, {(uint32_t)w, (uint32_t)h}
-			);
-
-			//all submitted commands are completed at this point
-			vk->completed = vk->lastsubmit;
+			recordupload(slot.image.image, buffer, offset, target.X, target.Y, w, h);
 		}
 
 		void settexturedata(Texture tex, const Containers::Image &data) {
@@ -640,6 +960,7 @@ namespace Gorgon :: GL {
 			vkWaitForFences(vk->device.logicalDevice, 1, &frame.sync.inFlightFence, VK_TRUE, UINT64_MAX);
 			vk->completed = std::max(vk->completed, frame.serial);
 			destroyretired();
+			recycleuploads();
 
 			if(ctx.outofdate || !ctx.presenter.swapChain) {
 				createswapchain(ctx);
@@ -667,7 +988,9 @@ namespace Gorgon :: GL {
 			ctx.recording = true;
 			ctx.inpass = false;
 			ctx.pipeline = nullptr;
+			ctx.firsttick = vk->usetick;
 			std::fill(std::begin(ctx.boundsets), std::end(ctx.boundsets), (VkDescriptorSet)VK_NULL_HANDLE);
+			std::fill(std::begin(ctx.boundtextures), std::end(ctx.boundtextures), (Texture)0);
 
 			return frame.commandbuffer;
 		}
@@ -853,6 +1176,17 @@ namespace Gorgon :: GL {
 				vk->retired.pop_front();
 			}
 
+			//command buffers are freed with their pool
+			recycle(vk->upload);
+			while(!vk->uploadsinflight.empty()) {
+				recycle(vk->uploadsinflight.front());
+				vk->uploadsinflight.pop_front();
+			}
+			for(auto &chunk : vk->freechunks) {
+				destroychunk(chunk);
+			}
+			vk->freechunks.clear();
+
 			for(auto &slot : vk->textures) {
 				if(slot.image.image) {
 					if(slot.framebuffer) {
@@ -965,12 +1299,27 @@ namespace Gorgon :: GL {
 			throw std::runtime_error("Cannot record the commands of the frame");
 		}
 
+		//uploads are executed before the frame, in the same submission
+		auto upload = closeuploads();
+
+		std::vector<VkCommandBuffer> commandbuffers;
+		if(upload) {
+			commandbuffers.push_back(upload);
+		}
+		commandbuffers.push_back(frame.commandbuffer);
+
 		VF::GraphicsQueueSubmit(
-			vk->device, frame.sync, {frame.commandbuffer},
+			vk->device, frame.sync, commandbuffers,
 			{frame.sync.imageAvailableSemaphore}, {ctx.renderfinished[ctx.imageindex]}
 		);
 
 		frame.serial = ++vk->lastsubmit;
+
+		if(upload) {
+			vk->upload.serial = frame.serial;
+			vk->uploadsinflight.push_back(std::move(vk->upload));
+			vk->upload = {};
+		}
 		ctx.recording = false;
 
 		auto result = VF::PresentQueueSubmit(vk->device, ctx.presenter, ctx.imageindex, {ctx.renderfinished[ctx.imageindex]});
@@ -1170,19 +1519,28 @@ namespace Gorgon :: GL {
 			ctx.pipeline = &pipeline;
 		}
 
-		//only the textures selected for this draw are bound, others could be in use as a render target
+		auto tick = ++vk->usetick;
+
+		//only the textures selected in this frame are bound, others could be in use as a render target
 		for(int unit = 0; unit < TextureUnits; unit++) {
-			if(!vk->activated[unit]) continue;
-
-			vk->activated[unit] = false;
-
-			auto tex = vk->activetextures[unit];
-			auto descriptor = vk->textures[isvalidtexture(tex) ? tex : 0].descriptor;
-
-			if(ctx.boundsets[unit] != descriptor) {
-				RC::BindDescriptorSets(commandbuffer, pipeline, {descriptor}, unit);
-				ctx.boundsets[unit] = descriptor;
+			if(vk->activated[unit]) {
+				vk->activated[unit] = false;
+				ctx.boundtextures[unit] = vk->activetextures[unit];
 			}
+			else if(!ctx.boundsets[unit]) {
+				continue;
+			}
+
+			//the image of the texture could be replaced or destroyed since it is bound
+			auto tex = ctx.boundtextures[unit];
+			auto &slot = vk->textures[isvalidtexture(tex) ? tex : 0];
+
+			if(ctx.boundsets[unit] != slot.descriptor) {
+				vkCmdBindDescriptorSets(commandbuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->pipelinelayout, unit, 1, &slot.descriptor, 0, nullptr);
+				ctx.boundsets[unit] = slot.descriptor;
+			}
+
+			slot.lastuse = tick;
 		}
 
 		RC::SetScissor(commandbuffer, getscissor(ctx));
